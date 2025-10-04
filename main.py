@@ -173,7 +173,7 @@ async def handle_text_in_photos(msg: Message, state: FSMContext):
             return
         await state.set_state(PostForm.price)
         logging.info(f"User {msg.from_user.id} finished uploading photos") # type: ignore
-        await msg.answer("Укажи цену (например: 2 990).", reply_markup=kb_main())
+        await msg.answer("Укажи цену.", reply_markup=kb_main())
     else:
         await msg.answer("Отправьте фото или напишите 'готово'.")
 
