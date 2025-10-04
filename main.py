@@ -21,11 +21,10 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            ReplyKeyboardMarkup)
 
 # ---------------- CONFIG ----------------
-# Замените на свои значения или используйте .env + python-dotenv
 API_TOKEN = "8477337530:AAHjoB6-Ve_bd-qDd-Uc-C4TXikkKMt3H7A"
 CHANNEL_ID = -1002328964343  # канал публикации
 MODER_CHAT_ID = -1002726262070  # чат модераторов
-ADMINS: List[int] = [6383171904]  # сюда ID владельца(ей)/админов, которые должны видеть уведомления
+ADMINS: List[int] = [6383171904]  # ID владельца(ей)/админов
 
 # ---------------- logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -38,7 +37,6 @@ class PostForm(StatesGroup):
     description = State()
     contact = State()
     city = State()
-    # внутренние состояния для модерации (если потребуется)
     waiting_reason = State()
 
 # ---------------- CallbackData ----------------
@@ -54,9 +52,7 @@ router = Router()
 dp.include_router(router)
 
 # ---------------- data storages ----------------
-# pending_posts: post_id -> data about post (author, photos, caption, mod_msg_id)
 pending_posts: Dict[str, Dict[str, Any]] = {}
-# awaiting_reasons: prompt_message_id -> {"post_id": str, "admin_id": int, "mod_msg_id": int}
 awaiting_reasons: Dict[int, Dict[str, Any]] = {}
 
 # lock file to avoid double-run locally
@@ -95,23 +91,20 @@ def normalize_contact(raw: Optional[str]) -> str:
     raw = raw.strip()
     if raw.startswith("@"):
         return raw
-    # допустимы t.me/username и telegram.me/username
     m = re.search(r"(?:t\.me/|telegram\.me/)(@?[\w\d_]+)", raw, re.IGNORECASE)
     if m:
         u = m.group(1)
         return u if u.startswith("@") else "@" + u
-    # если просто username без @
     if re.fullmatch(r"[\w\d_]+", raw):
         return "@" + raw
     return raw
 
-# ---------------- sanity check API token (optional) ----------------
+# ---------------- sanity check API token ----------------
 def check_token() -> None:
     try:
         r = requests.get(f"https://api.telegram.org/bot{API_TOKEN}/getMe", timeout=10)
         if r.status_code != 200:
             logging.error("Ошибка авторизации бота (getMe): %s", r.text)
-            # не выходим, но логируем
         else:
             logging.info("Bot authorized OK")
     except Exception as e:
@@ -121,31 +114,37 @@ check_token()
 
 # ---------------- Handlers (user flow) ----------------
 @router.message(Command("start"))
-async def cmd_start(msg: Message):
+async def cmd_start(msg: Message, state: FSMContext):
+    await state.clear()  # Ensure clean state on /start
+    logging.info(f"User {msg.from_user.id} started bot") # type: ignore
     await msg.answer("Привет! 👋 Это бот для публикации объявлений. Нажми кнопку ниже.", reply_markup=kb_main())
 
 @router.message(F.text == "ℹ️ Инфо")
-async def cmd_info(msg: Message):
+async def cmd_info(msg: Message, state: FSMContext):
+    await state.clear()  # Clear state to allow new post submission
     await msg.answer(
         "📌 Укажите в объявлении:\n"
         "•Фото товара — чёткие, с хорошим светом\n"
         "•Цена — укажите финальную стоимость\n"
         "•Состояние — новое / б/у\n"
         "•Описание — кратко (max 700 символов)\n"
-        "•Контакт — только @username (обязательно)\n"
-        "• Город (необязательно)\n",
+        "•Контакт — только @username (обязательно, 5-32 символа: буквы, цифры, _)\n"
+        "•Город (необязательно)\n",
         reply_markup=kb_main()
     )
 
 @router.message(F.text == "📦 Разместить объявление")
 async def cmd_sell(msg: Message, state: FSMContext):
+    await state.clear()  # Clear any existing state to start fresh
     await state.set_state(PostForm.photos)
     await state.update_data(photos=[])
+    logging.info(f"User {msg.from_user.id} started new post submission") # type: ignore
     await msg.answer("Отправь фото товара (1–5). Когда закончишь — напиши 'готово'.", reply_markup=kb_main())
 
 @router.message(F.text == "❌ Отмена")
 async def cmd_cancel_text(msg: Message, state: FSMContext):
     await state.clear()
+    logging.info(f"User {msg.from_user.id} cancelled operation") # type: ignore
     await msg.answer("Действие отменено.", reply_markup=kb_main())
 
 @router.message(F.photo, PostForm.photos)
@@ -160,6 +159,7 @@ async def handler_photo(msg: Message, state: FSMContext):
         return
     photos.append(msg.photo[-1].file_id)
     await state.update_data(photos=photos)
+    logging.info(f"User {msg.from_user.id} uploaded photo {len(photos)}/5") # type: ignore
     await msg.answer(f"Фото принято ({len(photos)}/5). Ещё или 'готово'?", reply_markup=kb_main())
 
 @router.message(PostForm.photos, F.text)
@@ -172,6 +172,7 @@ async def handle_text_in_photos(msg: Message, state: FSMContext):
             await msg.answer("Нужно хотя бы одно фото.", reply_markup=kb_main())
             return
         await state.set_state(PostForm.price)
+        logging.info(f"User {msg.from_user.id} finished uploading photos") # type: ignore
         await msg.answer("Укажи цену (например: 2 990).", reply_markup=kb_main())
     else:
         await msg.answer("Отправьте фото или напишите 'готово'.")
@@ -267,13 +268,14 @@ async def handler_city(msg: Message, state: FSMContext):
     # отправляем media_group в мод.чат
     try:
         sent = await bot.send_media_group(chat_id=MODER_CHAT_ID, media=media)
+        logging.info(f"Post {post_id} sent to moderation chat by user {author_id}")
     except Exception as e:
         logging.exception("Не удалось отправить media_group в мод.чат: %s", e)
         await msg.answer("Ошибка отправки на модерацию. Попробуйте позже.", reply_markup=kb_main())
         await state.clear()
         return
 
-    # Отправляем текст с кнопками (чтобы callback привязан к этому сообщению)
+    # Отправляем текст с кнопками
     moder_text = (
         f"<b>Новое объявление (id: {post_id})</b>\n\n"
         f"{caption}\n\n"
@@ -290,7 +292,7 @@ async def handler_city(msg: Message, state: FSMContext):
         await state.clear()
         return
 
-    # сохраняем пост в памяти: по id сообщения с кнопками
+    # сохраняем пост в памяти
     pending_posts[post_id] = {
         "author_id": author_id,
         "author_name": author_name,
@@ -302,8 +304,9 @@ async def handler_city(msg: Message, state: FSMContext):
         "time": now_str(),
     }
 
-    await msg.answer("✅ Твоё объявление отправлено на модерацию.", reply_markup=kb_main())
+    await msg.answer("✅ Твоё объявление отправлено на модерацию. Можешь отправить ещё одно!", reply_markup=kb_main())
     await state.clear()
+    logging.info(f"Post {post_id} submitted by user {author_id}, state cleared")
 
 # ---------------- Moderation callbacks ----------------
 @router.callback_query(ModerCallback.filter(F.action == "approve"))
@@ -327,6 +330,7 @@ async def on_approve(cb: CallbackQuery, callback_data: ModerCallback):
         media.append(InputMediaPhoto(media=fid, caption=caption if i == 0 else None))
     try:
         await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+        logging.info(f"Post {post_id} approved by admin {admin.id} and published")
     except Exception as e:
         logging.exception("Ошибка публикации в канал: %s", e)
         await cb.answer("Ошибка публикации", show_alert=True)
@@ -343,18 +347,16 @@ async def on_approve(cb: CallbackQuery, callback_data: ModerCallback):
     try:
         await bot.edit_message_text(chat_id=MODER_CHAT_ID, message_id=post["mod_message_id"], text=text_to_edit)
     except Exception:
-        # если редактирование не получилось — просто отправим сообщение
         await bot.send_message(chat_id=MODER_CHAT_ID, text=text_to_edit)
 
-    # отправим владельцам (ADMINS) лог о том кто опубликовал
+    # отправим владельцам (ADMINS) лог
     for owner in ADMINS:
         try:
             if owner != admin.id:
                 await bot.send_message(owner, f"🔵 Пост {post_id} опубликован модератором @{(admin.username or 'нет')} (id={admin.id}) в {now_str()}")
         except Exception:
-            logging.debug("Не удалось отправить уведомление владельцу %s", owner)
+            logging.debug("Не удалось уведомить владельца %s", owner)
 
-    # удаляем из очереди
     pending_posts.pop(post_id, None)
     await cb.answer("Объявление опубликовано")
 
@@ -371,9 +373,8 @@ async def on_reject(cb: CallbackQuery, callback_data: ModerCallback):
         await cb.answer("Пост не найден или уже обработан", show_alert=True)
         return
 
-    # Просим причину — отправляем служебное сообщение и ждём reply
     try:
-        prompt = await bot.send_message(chat_id=MODER_CHAT_ID, text="❌ Укажите причину отказа (ответом на это сообщение, max 4000 символов).")
+        prompt = await bot.send_message(chat_id=MODER_CHAT_ID, text=f"❌ Укажите причину отказа для поста {post_id} (ответом на это сообщение, max 4000 символов).")
     except Exception as e:
         logging.exception("Ошибка отправки prompt: %s", e)
         await cb.answer("Ошибка при запросе причины", show_alert=True)
@@ -382,7 +383,7 @@ async def on_reject(cb: CallbackQuery, callback_data: ModerCallback):
     awaiting_reasons[prompt.message_id] = {"post_id": post_id, "admin_id": admin.id, "mod_message_id": post["mod_message_id"]}
     await cb.answer("Напишите причину отказа как ответ на системное сообщение в мод.чате")
 
-# ---------------- Обработка причины (модератор реплаится на prompt) ----------------
+# ---------------- Обработка причины ----------------
 @router.message(F.reply_to_message)
 async def handle_reason_reply(msg: Message):
     reply_to = msg.reply_to_message
@@ -390,7 +391,7 @@ async def handle_reason_reply(msg: Message):
         return
     info = awaiting_reasons.get(reply_to.message_id)
     if not info:
-        return  # не наш prompt
+        return
     admin = msg.from_user
     if not admin or admin.id != info["admin_id"]:
         await msg.reply("Причину должен указать тот модератор, который запросил отклонение.")
@@ -410,7 +411,6 @@ async def handle_reason_reply(msg: Message):
         awaiting_reasons.pop(reply_to.message_id, None)
         return
 
-    # уведомляем автора — только причина и кто отказал (id + username)
     moderator_info = f"{admin.full_name} (id={admin.id}, @{admin.username or 'нет'})"
     try:
         await bot.send_message(chat_id=post["author_id"], text=(
@@ -421,17 +421,15 @@ async def handle_reason_reply(msg: Message):
     except Exception:
         logging.debug("Не удалось уведомить автора об отклонении (возможно, заблокировал бота).")
 
-    # уведомление в мод.чат о том кто и почему отклонил
     try:
         await bot.send_message(chat_id=MODER_CHAT_ID, text=(
-            f"❌ Отклонено\n"
+            f"❌ Отклонено {moderator_info}\n"
             f"Причина: «{reason}»\n"
             f"Пост id: {post_id}"
         ))
     except Exception:
         logging.exception("Не удалось отправить сообщение в мод.чат о причине")
 
-    # уведомление владельцам проекта (ADMINS) с полной информацией
     for owner in ADMINS:
         try:
             await bot.send_message(owner, (
@@ -444,26 +442,24 @@ async def handle_reason_reply(msg: Message):
         except Exception:
             logging.debug("Не удалось уведомить владельца %s", owner)
 
-    # пометим / отредактируем сообщение с кнопками (чтобы видно было, что обработан)
     try:
         await bot.edit_message_text(chat_id=MODER_CHAT_ID, message_id=post["mod_message_id"],
-                                    text=f"❌ Отклонено {moderator_info} — причина: {reason}\nПост id:{post_id}")
+                                   text=f"❌ Отклонено {moderator_info} — причина: {reason}\nПост id:{post_id}")
     except Exception:
-        # игнорируем ошибки редактирования
         pass
 
-    # очистка
     pending_posts.pop(post_id, None)
     awaiting_reasons.pop(reply_to.message_id, None)
+    logging.info(f"Post {post_id} rejected by admin {admin.id} with reason: {reason}")
 
-# ---------------- Fallback (прочие текстовые сообщения) ----------------
+# ---------------- Fallback ----------------
 @router.message(F.text)
 async def fallback_text(msg: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is None:
+        logging.info(f"User {msg.from_user.id} sent text in idle state: {msg.text}") # type: ignore
         await msg.answer("Я ожидаю от тебя действие: нажми кнопку 📦 Разместить объявление или ℹ️ Инфо.", reply_markup=kb_main())
         return
-    # Напоминаем в зависимости от состояния
     if current_state == PostForm.photos:
         await msg.answer("Отправьте фото или напишите 'готово'.")
     elif current_state == PostForm.price:
