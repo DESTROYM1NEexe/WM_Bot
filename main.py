@@ -181,7 +181,7 @@ async def handle_text_in_photos(msg: Message, state: FSMContext):
 async def handler_price(msg: Message, state: FSMContext):
     text = (msg.text or "").strip()
     if not text:
-        await msg.answer("Цена не может быть пустой. Введите цену (например: 2 990 или 'договорная').")
+        await msg.answer("Цена не может быть пустой. Введите цену.")
         return
     await state.update_data(price=text)
     await state.set_state(PostForm.condition)
@@ -195,7 +195,7 @@ async def handler_condition(msg: Message, state: FSMContext):
         return
     await state.update_data(condition=text)
     await state.set_state(PostForm.description)
-    await msg.answer("Описание товара (коротко, max 700 символов).", reply_markup=kb_main())
+    await msg.answer("Описание товара (коротко, max 700 символов, при необходимости укажите размер).", reply_markup=kb_main())
 
 @router.message(PostForm.description)
 async def handler_description(msg: Message, state: FSMContext):
