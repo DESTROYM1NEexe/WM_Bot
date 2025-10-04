@@ -1,346 +1,500 @@
 import asyncio
 import logging
-import os
 import re
 import uuid
-from typing import Dict, List, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
-from aiogram import Bot, Dispatcher, F
+import requests
+from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
+from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
-                           InlineKeyboardMarkup, InputMediaPhoto,
-                           KeyboardButton, Message, ReplyKeyboardMarkup)
-from dotenv import load_dotenv
+                           InlineKeyboardMarkup, InputMediaAudio,
+                           InputMediaDocument, InputMediaPhoto,
+                           InputMediaVideo, KeyboardButton, Message,
+                           ReplyKeyboardMarkup)
 
-# Загружаем переменные окружения
-load_dotenv()
+# ---------------- CONFIG ----------------
+# Замените на свои значения или используйте .env + python-dotenv
+API_TOKEN = "8477337530:AAHjoB6-Ve_bd-qDd-Uc-C4TXikkKMt3H7A"
+CHANNEL_ID = -1002328964343  # канал публикации
+MODER_CHAT_ID = -1002726262070  # чат модераторов
+ADMINS: List[int] = [6383171904]  # сюда ID владельца(ей)/админов, которые должны видеть уведомления
 
-API_TOKEN = os.getenv("BOT_TOKEN")
-if API_TOKEN is None:
-    raise ValueError("BOT_TOKEN not set in environment variables")
+# ---------------- logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-channel_id_str = os.getenv("CHANNEL_ID")
-if channel_id_str is None:
-    raise ValueError("CHANNEL_ID not set in environment variables")
-try:
-    CHANNEL_ID = int(channel_id_str)
-except ValueError:
-    raise ValueError("CHANNEL_ID must be an integer")
-
-mod_chat_id_str = os.getenv("MOD_CHAT_ID")
-if mod_chat_id_str is None:
-    raise ValueError("MOD_CHAT_ID not set in environment variables")
-try:
-    MOD_CHAT_ID = int(mod_chat_id_str)
-except ValueError:
-    raise ValueError("MOD_CHAT_ID must be an integer")
-
-admins_str = os.getenv("ADMINS", "")
-ADMINS = []
-if admins_str:
-    try:
-        ADMINS = [int(x) for x in admins_str.split(",") if x]
-    except ValueError:
-        raise ValueError("ADMINS must be comma-separated integers")
-
-logging.basicConfig(level=logging.INFO)
-
-# FSM
-class SellForm(StatesGroup):
+# ---------------- FSM ----------------
+class PostForm(StatesGroup):
     photos = State()
     price = State()
     condition = State()
     description = State()
-    size = State()
     contact = State()
     city = State()
+    # внутренние состояния для модерации (если потребуется)
+    waiting_reason = State()
 
-# Память для постов на модерации
-pending_posts: Dict[str, dict] = {}
+# ---------------- CallbackData ----------------
+class ModerCallback(CallbackData, prefix="moder"):
+    action: str
+    post_id: str
 
-# Бот и диспетчер
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+# ---------------- bot / dp ----------------
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
 
-# ===== Команды =====
-@dp.message(Command("id"))
-async def cmd_id(message: Message):
-    if message.from_user is None:
-        logging.warning("Message without from_user")
-        return
-    await message.answer(f"chat_id: {message.chat.id}\nuser_id: {message.from_user.id}")
+# ---------------- data storages ----------------
+# pending_posts: post_id -> data about post (author, photos, caption, mod_msg_id)
+pending_posts: Dict[str, Dict[str, Any]] = {}
+# awaiting_reasons: prompt_message_id -> {"post_id": str, "admin_id": int, "mod_msg_id": int}
+awaiting_reasons: Dict[int, Dict[str, Any]] = {}
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📦 Разместить объявление")],
-            [KeyboardButton(text="ℹ️ Инфо")],
-        ],
-        resize_keyboard=True,
-    )
-    await message.answer(
-        "Привет! 👋 Это бот WM.\n"
-        "Хочешь разместить объявление в канале?\n"
-        "Выберите действие:",
-        reply_markup=kb,
-    )
+# lock file to avoid double-run locally
+lock_file = Path("bot.lock")
+if lock_file.exists():
+    logging.warning("Файл bot.lock найден — удаляю и продолжаю (локальный dev режим).")
+    try:
+        lock_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+lock_file.touch()
 
-@dp.message(Command("info"))
-async def cmd_info(message: Message):
-    text = (
-        "📌 Правила размещения:\n\n"
-        "• Фото — 1-5 шт.\n"
-        "• Цена — финальная стоимость\n"
-        "• Состояние — новое / б/у\n"
-        "• Описание + размер в одной строке\n"
-        "• Контакт — @username или t.me/username\n"
-        "• Город — опционально\n\n"
-        "🔸 Мы не размещаем ссылки на каналы/магазины.\n"
-        "🚨 Размещение бесплатно."
-    )
-    await message.answer(text)
+# ---------------- helpers ----------------
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ===== Логика формы =====
-@dp.message(F.text == "📦 Разместить объявление")
-@dp.message(Command("sell"))
-async def cmd_sell(message: Message, state: FSMContext):
-    await state.set_state(SellForm.photos)
-    await message.answer("Отправь фото товара (1-5). Когда закончишь — напиши `готово`.")
+def kb_main() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(text="📦 Разместить объявление"), KeyboardButton(text="ℹ️ Инфо")],
+        [KeyboardButton(text="❌ Отмена")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
-@dp.message(SellForm.photos, F.photo)
-async def process_photos(message: Message, state: FSMContext):
-    data = await state.get_data()
-    photos: List[str] = data.get("photos", [])
-    if message.photo and len(message.photo) > 0:
-        photos.append(message.photo[-1].file_id)
-    else:
-        await message.answer("Это не фото. Отправь фото.")
-        return
-    if len(photos) > 5:
-        await message.answer("Можно максимум 5 фото ❗")
-        return
-    await state.update_data(photos=photos)
-    await message.answer(f"Фото приняты ({len(photos)}/5). Пришли ещё или напиши `готово`.")
-
-@dp.message(SellForm.photos, F.text.lower() == "готово")
-async def finish_photos(message: Message, state: FSMContext):
-    data = await state.get_data()
-    if not data.get("photos"):
-        await message.answer("Ты не отправил ни одного фото. Отправь фото или нажми /cancel.")
-        return
-    await state.set_state(SellForm.price)
-    await message.answer("Укажи цену.")
-
-@dp.message(SellForm.price)
-async def process_price(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Пожалуйста, укажи цену текстом.")
-        return
-    price = re.sub(r"\s+", " ", message.text.strip())
-    if not price:
-        await message.answer("Цена не может быть пустой. Укажи цену.")
-        return
-    await state.update_data(price=price)
-    await state.set_state(SellForm.condition)
-    await message.answer("Состояние (новое / б/у).")
-
-@dp.message(SellForm.condition)
-async def process_condition(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Пожалуйста, укажи состояние текстом.")
-        return
-    condition = message.text.strip()
-    if not condition:
-        await message.answer("Состояние не может быть пустым. Укажи состояние.")
-        return
-    await state.update_data(condition=condition)
-    await state.set_state(SellForm.description)
-    await message.answer("Описание.")
-
-@dp.message(SellForm.description)
-async def process_description(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Пожалуйста, укажи описание текстом.")
-        return
-    description = message.text.strip()
-    if not description:
-        await message.answer("Описание не может быть пустым. Укажи описание.")
-        return
-    await state.update_data(description=description)
-    await state.set_state(SellForm.size)
-    await message.answer("Размер (или 'нет').")
-
-@dp.message(SellForm.size)
-async def process_size(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Пожалуйста, укажи размер текстом.")
-        return
-    size = message.text.strip()
-    await state.update_data(size=size)
-    await state.set_state(SellForm.contact)
-    await message.answer("Контакт (@username или t.me/username).")
+def kb_moder(post_id: str) -> InlineKeyboardMarkup:
+    inline_keyboard = [
+        [
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=ModerCallback(action="approve", post_id=post_id).pack()),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=ModerCallback(action="reject", post_id=post_id).pack()),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
 
 def normalize_contact(raw: Optional[str]) -> str:
-    if raw is None:
-        return ""
-    raw = raw.strip()
     if not raw:
         return ""
+    raw = raw.strip()
+    if raw.startswith("@"):
+        return raw
+    # допустимы t.me/username и telegram.me/username
     m = re.search(r"(?:t\.me/|telegram\.me/)(@?[\w\d_]+)", raw, re.IGNORECASE)
     if m:
-        username = m.group(1)
-        if not username.startswith("@"):
-            username = "@" + username
-        return username
-    if re.fullmatch(r"[\w\d_]+", raw, re.IGNORECASE):
+        u = m.group(1)
+        return u if u.startswith("@") else "@" + u
+    # если просто username без @
+    if re.fullmatch(r"[\w\d_]+", raw):
         return "@" + raw
-    if raw.startswith("@") and re.fullmatch(r"@[\w\d_]+", raw, re.IGNORECASE):
-        return raw
-    return ""
+    return raw
 
-@dp.message(SellForm.contact)
-async def process_contact(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Пожалуйста, укажи контакт текстом.")
+# ---------------- sanity check API token (optional) ----------------
+def check_token() -> None:
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{API_TOKEN}/getMe", timeout=10)
+        if r.status_code != 200:
+            logging.error("Ошибка авторизации бота (getMe): %s", r.text)
+            # не выходим, но логируем
+        else:
+            logging.info("Bot authorized OK")
+    except Exception as e:
+        logging.warning("Не удалось проверить токен: %s", e)
+
+check_token()
+
+# ---------------- Handlers (user flow) ----------------
+@router.message(Command("start"))
+async def cmd_start(msg: Message):
+    await msg.answer("Привет! 👋 Это бот для публикации объявлений. Нажми кнопку ниже.", reply_markup=kb_main())
+
+@router.message(F.text == "ℹ️ Инфо")
+async def cmd_info(msg: Message):
+    await msg.answer(
+        "📌 Укажите в объявлении:\n"
+        "•Фото товара — чёткие, с хорошим светом\n"
+        "•Цена — укажите финальную стоимость\n"
+        "•Состояние — новое / б/у\n"
+        "•Описание — кратко (max 700 символов)\n"
+        "•Контакт — только @username (обязательно)\n"
+        "• Город (необязательно)\n",
+        reply_markup=kb_main()
+    )
+
+@router.message(F.text == "📦 Разместить объявление")
+async def cmd_sell(msg: Message, state: FSMContext):
+    await state.set_state(PostForm.photos)
+    await state.update_data(photos=[])
+    await msg.answer("Отправь фото товара (1–5). Когда закончишь — напиши 'готово'.", reply_markup=kb_main())
+
+@router.message(F.text == "❌ Отмена")
+async def cmd_cancel_text(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Действие отменено.", reply_markup=kb_main())
+
+@router.message(F.photo, PostForm.photos)
+async def handler_photo(msg: Message, state: FSMContext):
+    if not msg.photo:
+        await msg.answer("Это не фото, отправьте изображение.")
         return
-    contact = normalize_contact(message.text)
-    if not contact or not contact.startswith("@"):
-        await message.answer(
-            "Контакт должен быть в формате @username или ссылка t.me/username.\n"
-            "Отправь повторно."
-        )
+    data = await state.get_data()
+    photos = data.get("photos", [])
+    if len(photos) >= 5:
+        await msg.answer("Максимум 5 фото. Напишите 'готово' для продолжения.")
+        return
+    photos.append(msg.photo[-1].file_id)
+    await state.update_data(photos=photos)
+    await msg.answer(f"Фото принято ({len(photos)}/5). Ещё или 'готово'?", reply_markup=kb_main())
+
+@router.message(PostForm.photos, F.text)
+async def handle_text_in_photos(msg: Message, state: FSMContext):
+    text = (msg.text or "").lower().strip()
+    if text == "готово":
+        data = await state.get_data()
+        photos = data.get("photos", [])
+        if not photos:
+            await msg.answer("Нужно хотя бы одно фото.", reply_markup=kb_main())
+            return
+        await state.set_state(PostForm.price)
+        await msg.answer("Укажи цену (например: 2 990).", reply_markup=kb_main())
+    else:
+        await msg.answer("Отправьте фото или напишите 'готово'.")
+
+@router.message(PostForm.price)
+async def handler_price(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    if not text:
+        await msg.answer("Цена не может быть пустой. Введите цену (например: 2 990 или 'договорная').")
+        return
+    await state.update_data(price=text)
+    await state.set_state(PostForm.condition)
+    await msg.answer("Состояние (новое / б/у).", reply_markup=kb_main())
+
+@router.message(PostForm.condition)
+async def handler_condition(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    if not text:
+        await msg.answer("Укажите состояние (например: новое или б/у).")
+        return
+    await state.update_data(condition=text)
+    await state.set_state(PostForm.description)
+    await msg.answer("Описание товара (коротко, max 700 символов).", reply_markup=kb_main())
+
+@router.message(PostForm.description)
+async def handler_description(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip()
+    if not text:
+        await msg.answer("Описание не может быть пустым. Введите описание.")
+        return
+    if len(text) > 700:
+        await msg.answer("Описание слишком длинное (max 700 символов). Укоротите и отправьте снова.")
+        return
+    await state.update_data(description=text)
+    await state.set_state(PostForm.contact)
+    await msg.answer("Контакт — обязательно @username (например: @ivan).", reply_markup=kb_main())
+
+@router.message(PostForm.contact)
+async def handler_contact(msg: Message, state: FSMContext):
+    raw = (msg.text or "").strip()
+    contact = normalize_contact(raw)
+    if not contact.startswith("@"):
+        await msg.answer("Контакт обязателен и должен начинаться с @. Введите снова (только @username).")
+        return
+    if not re.match(r'^@[a-zA-Z\d_]{5,32}$', contact, re.IGNORECASE):
+        await msg.answer("Неверный формат @username (5-32 символа: буквы, цифры, _). Введите снова.")
         return
     await state.update_data(contact=contact)
-    await state.set_state(SellForm.city)
-    await message.answer("Укажи город (или 'нет').")
+    await state.set_state(PostForm.city)
+    await msg.answer("Город (необязательно). Напишите 'нет', если не указывать.", reply_markup=kb_main())
 
-@dp.message(SellForm.city)
-async def process_city(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Пожалуйста, укажи город текстом.")
-        return
-    city = message.text.strip()
-    await state.update_data(city=city)
+@router.message(PostForm.city)
+async def handler_city(msg: Message, state: FSMContext):
+    city_text = (msg.text or "").strip()
+    if not city_text:
+        city_text = "нет"
+    await state.update_data(city=city_text)
+
     data = await state.get_data()
-
-    desc_line = data.get("description", "")
-    size = data.get("size", "")
-    if size and size.lower() != "нет":
-        if "размер" not in desc_line.lower():
-            desc_line = f"{desc_line} размер {size}".strip()
-
-    caption = (
-        f"Цена: {data.get('price', '')}\n"
-        f"Состояние: {data.get('condition', '')}\n"
-        f"Описание: {desc_line}\n"
-        f"Купить: {data.get('contact', '')}"
-    )
-    if city and city.lower() != "нет":
-        caption += f"\nГород: {city}"
-
-    photos = data.get("photos", [])
+    photos: List[str] = data.get("photos", [])
     if not photos:
-        await message.answer("Нет фото. Отмена.")
+        await msg.answer("Ошибка: фото не найдены. Начните заново.", reply_markup=kb_main())
         await state.clear()
         return
 
-    # Define media list explicitly to avoid undefined variable errors
-    media: List[InputMediaPhoto] = []
-    for i, file_id in enumerate(photos):
-        media.append(InputMediaPhoto(media=file_id, caption=caption if i == 0 else None))
+    # Формируем подпись (caption)
+    caption_lines = [
+        f"Цена: {data.get('price','')}",
+        f"Состояние: {data.get('condition','')}",
+        f"Описание: {data.get('description','')}",
+        f"Контакт: {data.get('contact','')}"
+    ]
+    if city_text.lower() != "нет":
+        caption_lines.append(f"📍 Город: {city_text}")
+    caption = "\n".join(caption_lines)
+    if len(caption) > 1024:
+        await msg.answer("Общая подпись слишком длинная. Укоротите описание или другие поля и попробуйте заново.")
+        await state.set_state(PostForm.description)
+        return
 
+    # Формируем media для отправки в модеральный чат
+    media: List[Union[InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio]] = []
+    for i, fid in enumerate(photos):
+        media.append(InputMediaPhoto(media=fid, caption=caption if i == 0 else None))
+
+    # создаём уникальный id поста
     post_id = str(uuid.uuid4())
+    author = msg.from_user
+    author_id = author.id if author else 0
+    author_name = author.full_name if author else "unknown"
+    author_username = ("@" + author.username) if (author and author.username) else "нет"
+
+    # отправляем media_group в мод.чат
+    try:
+        sent = await bot.send_media_group(chat_id=MODER_CHAT_ID, media=media)
+    except Exception as e:
+        logging.exception("Не удалось отправить media_group в мод.чат: %s", e)
+        await msg.answer("Ошибка отправки на модерацию. Попробуйте позже.", reply_markup=kb_main())
+        await state.clear()
+        return
+
+    # Отправляем текст с кнопками (чтобы callback привязан к этому сообщению)
+    moder_text = (
+        f"<b>Новое объявление (id: {post_id})</b>\n\n"
+        f"{caption}\n\n"
+        f"👤 От: <a href='tg://user?id={author_id}'>{author_name}</a>\n"
+        f"🆔 ID: <code>{author_id}</code>\n"
+        f"🔗 Username: {author_username}\n"
+        f"🕒 Время: {now_str()}"
+    )
+    try:
+        mod_msg = await bot.send_message(chat_id=MODER_CHAT_ID, text=moder_text, reply_markup=kb_moder(post_id))
+    except Exception as e:
+        logging.exception("Не удалось отправить текст модерации: %s", e)
+        await msg.answer("Ошибка отправки на модерацию (текст). Попробуйте позже.", reply_markup=kb_main())
+        await state.clear()
+        return
+
+    # сохраняем пост в памяти: по id сообщения с кнопками
     pending_posts[post_id] = {
-        "user_id": message.from_user.id if message.from_user else 0,
+        "author_id": author_id,
+        "author_name": author_name,
+        "author_username": author_username,
         "photos": photos,
         "caption": caption,
+        "mod_message_id": mod_msg.message_id,
+        "mod_chat_id": MODER_CHAT_ID,
+        "time": now_str(),
     }
 
-    try:
-        sent = await bot.send_media_group(chat_id=MOD_CHAT_ID, media=media) # type: ignore
-        if not sent:
-            raise ValueError("No messages sent")
-        moderator_msg_id = sent[0].message_id
+    await msg.answer("✅ Твоё объявление отправлено на модерацию.", reply_markup=kb_main())
+    await state.clear()
 
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{post_id}"),
-                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{post_id}"),
-                ]
-            ]
-        )
-
-        await bot.send_message(MOD_CHAT_ID, f"ℹ️ Новое объявление (id: {post_id})", reply_markup=kb)
-        await message.answer("✅ Твоё объявление отправлено на модерацию.")
-    except Exception as e:
-        logging.error(f"Error sending to mod chat: {e}")
-        await message.answer("Ошибка при отправке на модерацию. Попробуй позже.")
-    finally:
-        await state.clear()
-
-@dp.callback_query(F.data.startswith(("approve:", "reject:")))
-async def process_moderation(callback: CallbackQuery):
-    if callback.from_user is None:
-        await callback.answer("No user", show_alert=True)
-        return
-    if callback.from_user.id not in ADMINS:
-        await callback.answer("Нет прав модератора", show_alert=True)
-        return
-    if callback.data is None:
-        await callback.answer("No data", show_alert=True)
+# ---------------- Moderation callbacks ----------------
+@router.callback_query(ModerCallback.filter(F.action == "approve"))
+async def on_approve(cb: CallbackQuery, callback_data: ModerCallback):
+    admin = cb.from_user
+    if admin is None or admin.id not in ADMINS:
+        await cb.answer("У тебя нет прав модератора", show_alert=True)
         return
 
-    try:
-        action, post_id = callback.data.split(":", 1)
-    except ValueError:
-        await callback.answer("Invalid callback data", show_alert=True)
-        return
-
+    post_id = callback_data.post_id
     post = pending_posts.get(post_id)
     if not post:
-        await callback.answer("Пост не найден", show_alert=True)
+        await cb.answer("Пост не найден или уже обработан", show_alert=True)
         return
 
-    # Define media list explicitly to avoid undefined variable errors
-    media: List[InputMediaPhoto] = []
-    for i, file_id in enumerate(post["photos"]):
-        media.append(InputMediaPhoto(media=file_id, caption=post["caption"] if i == 0 else None))
+    # Опубликовать в канал
+    photos = post.get("photos", [])
+    caption = post.get("caption", "")
+    media: List[Union[InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio]] = []
+    for i, fid in enumerate(photos):
+        media.append(InputMediaPhoto(media=fid, caption=caption if i == 0 else None))
+    try:
+        await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+    except Exception as e:
+        logging.exception("Ошибка публикации в канал: %s", e)
+        await cb.answer("Ошибка публикации", show_alert=True)
+        return
 
-    if action == "approve":
-        try:
-            await bot.send_media_group(chat_id=CHANNEL_ID, media=media) # type: ignore
-            await callback.answer("✅ Объявление опубликовано")
-            try:
-                await bot.send_message(post["user_id"], "Ваше объявление было одобрено ✅")
-            except Exception as e:
-                logging.error(f"Error notifying user: {e}")
-        except Exception as e:
-            logging.error(f"Error publishing: {e}")
-            await callback.answer("Ошибка при публикации", show_alert=True)
-    else:
-        await callback.answer("❌ Отклонено")
-        try:
-            await bot.send_message(post["user_id"], "Ваше объявление было отклонено ❌")
-        except Exception as e:
-            logging.error(f"Error notifying user: {e}")
+    # уведомляем автора
+    try:
+        await bot.send_message(chat_id=post["author_id"], text=f"✅ Ваше объявление (ID: {post_id}) одобрено и опубликовано.")
+    except Exception:
+        logging.debug("Не удалось уведомить автора (возможно, он заблокировал бота).")
 
+    # сообщаем в мод.чат / редактируем сообщение с кнопками
+    text_to_edit = f"✅ Опубликовано @{(admin.username or 'нет')} (ID: {admin.id}) — пост id:{post_id}"
+    try:
+        await bot.edit_message_text(chat_id=MODER_CHAT_ID, message_id=post["mod_message_id"], text=text_to_edit)
+    except Exception:
+        # если редактирование не получилось — просто отправим сообщение
+        await bot.send_message(chat_id=MODER_CHAT_ID, text=text_to_edit)
+
+    # отправим владельцам (ADMINS) лог о том кто опубликовал
+    for owner in ADMINS:
+        try:
+            if owner != admin.id:
+                await bot.send_message(owner, f"🔵 Пост {post_id} опубликован модератором @{(admin.username or 'нет')} (id={admin.id}) в {now_str()}")
+        except Exception:
+            logging.debug("Не удалось отправить уведомление владельцу %s", owner)
+
+    # удаляем из очереди
     pending_posts.pop(post_id, None)
+    await cb.answer("Объявление опубликовано")
 
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Действие отменено.")
+@router.callback_query(ModerCallback.filter(F.action == "reject"))
+async def on_reject(cb: CallbackQuery, callback_data: ModerCallback):
+    admin = cb.from_user
+    if admin is None or admin.id not in ADMINS:
+        await cb.answer("У тебя нет прав модератора", show_alert=True)
+        return
 
+    post_id = callback_data.post_id
+    post = pending_posts.get(post_id)
+    if not post:
+        await cb.answer("Пост не найден или уже обработан", show_alert=True)
+        return
+
+    # Просим причину — отправляем служебное сообщение и ждём reply
+    try:
+        prompt = await bot.send_message(chat_id=MODER_CHAT_ID, text="❌ Укажите причину отказа (ответом на это сообщение, max 4000 символов).")
+    except Exception as e:
+        logging.exception("Ошибка отправки prompt: %s", e)
+        await cb.answer("Ошибка при запросе причины", show_alert=True)
+        return
+
+    awaiting_reasons[prompt.message_id] = {"post_id": post_id, "admin_id": admin.id, "mod_message_id": post["mod_message_id"]}
+    await cb.answer("Напишите причину отказа как ответ на системное сообщение в мод.чате")
+
+# ---------------- Обработка причины (модератор реплаится на prompt) ----------------
+@router.message(F.reply_to_message)
+async def handle_reason_reply(msg: Message):
+    reply_to = msg.reply_to_message
+    if not reply_to:
+        return
+    info = awaiting_reasons.get(reply_to.message_id)
+    if not info:
+        return  # не наш prompt
+    admin = msg.from_user
+    if not admin or admin.id != info["admin_id"]:
+        await msg.reply("Причину должен указать тот модератор, который запросил отклонение.")
+        return
+    reason = (msg.text or "").strip()
+    if not reason:
+        await msg.reply("Причина не может быть пустой.")
+        return
+    if len(reason) > 4000:
+        await msg.reply("Причина слишком длинная (max 4000 символов). Укоротите.")
+        return
+
+    post_id = info["post_id"]
+    post = pending_posts.get(post_id)
+    if not post:
+        await msg.reply("Пост уже обработан или не найден.")
+        awaiting_reasons.pop(reply_to.message_id, None)
+        return
+
+    # уведомляем автора — только причина и кто отказал (id + username)
+    moderator_info = f"{admin.full_name} (id={admin.id}, @{admin.username or 'нет'})"
+    try:
+        await bot.send_message(chat_id=post["author_id"], text=(
+            f"❌ Ваше объявление (ID: {post_id}) отклонено.\n"
+            f"Причина: «{reason}»\n\n"
+            f"Проверьте требования и попробуйте отправить снова."
+        ))
+    except Exception:
+        logging.debug("Не удалось уведомить автора об отклонении (возможно, заблокировал бота).")
+
+    # уведомление в мод.чат о том кто и почему отклонил
+    try:
+        await bot.send_message(chat_id=MODER_CHAT_ID, text=(
+            f"❌ Отклонено {moderator_info}\n"
+            f"Причина: «{reason}»\n"
+            f"Пост id: {post_id}"
+        ))
+    except Exception:
+        logging.exception("Не удалось отправить сообщение в мод.чат о причине")
+
+    # уведомление владельцам проекта (ADMINS) с полной информацией
+    for owner in ADMINS:
+        try:
+            await bot.send_message(owner, (
+                f"🔴 Пост {post_id} отклонён в {now_str()}.\n"
+                f"Модератор: {moderator_info}\n"
+                f"Причина: {reason}\n"
+                f"Автор id: {post['author_id']}, username: {post['author_username']}\n"
+                f"Содержимое (caption):\n{post['caption']}"
+            ))
+        except Exception:
+            logging.debug("Не удалось уведомить владельца %s", owner)
+
+    # пометим / отредактируем сообщение с кнопками (чтобы видно было, что обработан)
+    try:
+        await bot.edit_message_text(chat_id=MODER_CHAT_ID, message_id=post["mod_message_id"],
+                                    text=f"❌ Отклонено {moderator_info} — причина: {reason}\nПост id:{post_id}")
+    except Exception:
+        # игнорируем ошибки редактирования
+        pass
+
+    # очистка
+    pending_posts.pop(post_id, None)
+    awaiting_reasons.pop(reply_to.message_id, None)
+
+# ---------------- Fallback (прочие текстовые сообщения) ----------------
+@router.message(F.text)
+async def fallback_text(msg: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await msg.answer("Я ожидаю от тебя действие: нажми кнопку 📦 Разместить объявление или ℹ️ Инфо.", reply_markup=kb_main())
+        return
+    # Напоминаем в зависимости от состояния
+    if current_state == PostForm.photos:
+        await msg.answer("Отправьте фото или напишите 'готово'.")
+    elif current_state == PostForm.price:
+        await msg.answer("Укажите цену (например: 2 990 или 'договорная').")
+    elif current_state == PostForm.condition:
+        await msg.answer("Укажите состояние (например: новое или б/у).")
+    elif current_state == PostForm.description:
+        await msg.answer("Введите описание товара (коротко, max 700 символов).")
+    elif current_state == PostForm.contact:
+        await msg.answer("Введите контакт — обязательно @username (например: @ivan).")
+    elif current_state == PostForm.city:
+        await msg.answer("Укажите город (необязательно) или 'нет'.")
+    else:
+        await msg.answer("Неизвестное состояние. Нажмите ❌ Отмена для выхода.", reply_markup=kb_main())
+
+# ---------------- graceful shutdown ----------------
+async def on_shutdown():
+    try:
+        if lock_file.exists():
+            lock_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+    await bot.session.close()
+
+# ---------------- run ----------------
 async def main():
+    logging.info("Bot starting")
     try:
         await dp.start_polling(bot)
-    except Exception as e:
-        logging.error(f"Polling error: {e}")
+    finally:
+        await on_shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
