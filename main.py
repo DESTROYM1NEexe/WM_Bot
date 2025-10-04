@@ -424,7 +424,7 @@ async def handle_reason_reply(msg: Message):
     # уведомление в мод.чат о том кто и почему отклонил
     try:
         await bot.send_message(chat_id=MODER_CHAT_ID, text=(
-            f"❌ Отклонено {moderator_info}\n"
+            f"❌ Отклонено\n"
             f"Причина: «{reason}»\n"
             f"Пост id: {post_id}"
         ))
